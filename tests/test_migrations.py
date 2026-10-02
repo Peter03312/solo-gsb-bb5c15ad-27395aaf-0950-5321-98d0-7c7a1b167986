@@ -132,8 +132,8 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
     def test_fresh_database_applies_every_version_in_order(self):
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         self.assertEqual(previous, 0)
-        self.assertEqual(applied, [1, 2, 3])
-        self.assertEqual(self._versions(), {1, 2, 3})
+        self.assertEqual(applied, [1, 2, 3, 4])
+        self.assertEqual(self._versions(), {1, 2, 3, 4})
         tables = set(inspect(self.engine).get_table_names())
         self.assertIn("schema_migrations", tables)
         for expected in (
@@ -147,8 +147,60 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             "read_bundle_items",
             "credential_rotations",
             "read_audit_events",
+            "record_freezes",
         ):
             self.assertIn(expected, tables)
+
+    def test_record_freezes_partial_unique_index(self):
+        """v4：record_freezes 部分唯一索引保证每记录至多一个进行中冻结期，
+        但冻结-解除-再冻结可留下多行历史。"""
+        from sqlalchemy.exc import IntegrityError
+
+        migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
+        with self.engine.begin() as conn:
+            rid = conn.execute(
+                text(
+                    "INSERT INTO records (id, current_version, created_at, updated_at) "
+                    "VALUES (gen_random_uuid(), 1, now(), now()) RETURNING id"
+                )
+            ).scalar_one()
+            # 首次冻结期
+            conn.execute(
+                text(
+                    "INSERT INTO record_freezes (id, record_id, reason, frozen_at) "
+                    "VALUES (gen_random_uuid(), :rid, 'r1', now())"
+                ),
+                {"rid": rid},
+            )
+            # 同记录第二个进行中冻结期 -> 违反部分唯一索引（用 SAVEPOINT 隔离失败）
+            conn.execute(text("SAVEPOINT sp_duplicate_freeze"))
+            with self.assertRaises(IntegrityError):
+                conn.execute(
+                    text(
+                        "INSERT INTO record_freezes (id, record_id, reason, frozen_at) "
+                        "VALUES (gen_random_uuid(), :rid, 'r2', now())"
+                    ),
+                    {"rid": rid},
+                )
+            conn.execute(text("ROLLBACK TO SAVEPOINT sp_duplicate_freeze"))
+            # 解除后再冻结：历史期 unfrozen_at 非空，不冲突
+            conn.execute(
+                text("UPDATE record_freezes SET unfrozen_at = now() "
+                     "WHERE record_id = :rid AND unfrozen_at IS NULL"),
+                {"rid": rid},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO record_freezes (id, record_id, reason, frozen_at) "
+                    "VALUES (gen_random_uuid(), :rid, 'r3', now())"
+                ),
+                {"rid": rid},
+            )
+            count = conn.execute(
+                text("SELECT count(*) FROM record_freezes WHERE record_id = :rid"),
+                {"rid": rid},
+            ).scalar_one()
+        self.assertEqual(count, 2)
 
     def test_migrations_module_is_self_contained_for_metadata(self):
         """只导入 app.migrations（不导入 app.models）也能建出全部业务表。
@@ -166,8 +218,9 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             f"eng = create_engine({self.url!r});"
             "prev, applied = migrations.run_upgrade(eng, connect_retries=1, connect_retry_delay=0);"
             "names = set(inspect(eng).get_table_names());"
-            "assert applied == [1, 2, 3], applied;"
+            "assert applied == [1, 2, 3, 4], applied;"
             "assert 'records' in names and 'read_audit_events' in names, names;"
+            "assert 'record_freezes' in names, names;"
             "print('SELF_CONTAINED_OK')"
         )
         env = dict(os.environ)
@@ -314,9 +367,9 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        # 旧库补登 v1 基线：v1 不重放，只增量执行 v2/v3
+        # 旧库补登 v1 基线：v1 不重放，只增量执行 v2/v3/v4
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3])
+        self.assertEqual(applied, [2, 3, 4])
 
         with self.engine.connect() as conn:
             baseline_name = conn.execute(
@@ -325,6 +378,8 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             self.assertIn("基线", baseline_name)
             columns = {c["name"] for c in inspect(self.engine).get_columns("records")}
             self.assertIn("controlled", columns)
+            # v4 幂等补出记录冻结期表，既有数据不受影响
+            self.assertIn("record_freezes", set(inspect(self.engine).get_table_names()))
 
         # 记录与快照保留：旧记录默认非受控，旧快照默认未撤回、仍可读取
         SessionLocal.configure(bind=self.engine)
@@ -402,7 +457,7 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        self.assertEqual((previous, applied), (1, [2, 3]))
+        self.assertEqual((previous, applied), (1, [2, 3, 4]))
         with self.engine.connect() as conn:
             reads_used, chain_id, rotated = conn.execute(
                 text(
@@ -489,7 +544,8 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
         migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         # 回到“只完成 v1”的状态，让升级重新尝试 v2
         with self.engine.begin() as conn:
-            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3)"))
+            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4)"))
+            conn.execute(text("DROP TABLE IF EXISTS record_freezes"))
             conn.execute(
                 text(
                     "DROP TRIGGER IF EXISTS trg_read_audit_events_no_update "
@@ -540,18 +596,18 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
             locker.execute(text("ROLLBACK"))
             locker.close()
 
-        # 释放阻塞后重试：v2/v3 依次成功
+        # 释放阻塞后重试：v2/v3/v4 依次成功
         previous, applied = migrations.run_upgrade(
             self.engine, connect_retries=1, connect_retry_delay=0
         )
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3])
+        self.assertEqual(applied, [2, 3, 4])
         with self.engine.connect() as conn:
             versions = {
                 row[0]
                 for row in conn.execute(text("SELECT version FROM schema_migrations"))
             }
-        self.assertEqual(versions, {1, 2, 3})
+        self.assertEqual(versions, {1, 2, 3, 4})
 
     def test_http_traffic_blocked_when_schema_not_ready(self):
         from fastapi.testclient import TestClient
@@ -612,9 +668,9 @@ class ConcurrentStartupTests(unittest.TestCase):
 
         self.assertEqual(len(results), num_instances)
         self.assertTrue(all(isinstance(r, tuple) for r in results), results)
-        # 恰好一个实例真正执行了 [1,2,3]，其余 applied 为空
+        # 恰好一个实例真正执行了 [1,2,3,4]，其余 applied 为空
         applied_lists = [applied for _, applied in results]
-        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3])
+        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4])
         self.assertTrue(all(applied == [] for applied in applied_lists[1:]), applied_lists)
         with self.engine.connect() as conn:
             versions = [
@@ -623,7 +679,7 @@ class ConcurrentStartupTests(unittest.TestCase):
                     text("SELECT version FROM schema_migrations ORDER BY version")
                 )
             ]
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
 
     def test_advisory_lock_key_is_stable(self):
         # 锁键固定：各实例竞争的是同一把集群级锁

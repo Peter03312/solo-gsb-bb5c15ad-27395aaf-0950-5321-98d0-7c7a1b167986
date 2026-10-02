@@ -2644,5 +2644,531 @@ class ReadAuditEventIntegrationTests(unittest.TestCase):
         self.assertEqual(r.status_code, 401)
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class RecordFreezeIntegrationTests(unittest.TestCase):
+    """记录临时冻结：冻结/状态/解除幂等、覆盖全部快照、不扣次数不写审计、
+    与读取的提交边界一致、解除只恢复原有资格。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    # ---- 工具方法 ----
+
+    def _publish(self, version=1, max_reads=None):
+        body = {"version": version}
+        if max_reads is not None:
+            body["max_reads"] = max_reads
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _revise_and_publish(self, version, base_version, max_reads=None):
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={
+                "base_version": base_version,
+                "text": TEXT_V2,
+                "intervals": [{"start": 0, "end": 3}],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return self._publish(version=version, max_reads=max_reads)
+
+    def _read(self, sid, credential, expected=200):
+        r = self.client.get(f"/public/snapshots/{sid}?token={credential}")
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _freeze(self, reason="临时阻断外部阅览", expected=200, body=None):
+        payload = body if body is not None else {"reason": reason}
+        r = self.client.post(
+            f"/records/{self.record_id}/freeze",
+            headers=SERVICE_HEADERS,
+            json=payload,
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _unfreeze(self, expected=200):
+        r = self.client.post(
+            f"/records/{self.record_id}/unfreeze", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _status(self):
+        return self.client.get(
+            f"/records/{self.record_id}/freeze", headers=SERVICE_HEADERS
+        )
+
+    def _audit_count(self, sid):
+        from app.db import SessionLocal
+        from app.models import ReadAuditEvent
+
+        with SessionLocal() as session:
+            return (
+                session.query(ReadAuditEvent)
+                .filter(ReadAuditEvent.snapshot_id == sid)
+                .count()
+            )
+
+    # ---- 鉴权与入参 ----
+
+    def test_freeze_status_unfreeze_require_service_key(self):
+        import uuid
+
+        for method, path in (
+            ("POST", f"/records/{self.record_id}/freeze"),
+            ("POST", f"/records/{self.record_id}/unfreeze"),
+            ("GET", f"/records/{self.record_id}/freeze"),
+        ):
+            r = self.client.request(method, path, json={"reason": "x"})
+            self.assertEqual(r.status_code, 401, path)
+        # 错误密钥同样 401
+        r = self.client.post(
+            f"/records/{uuid.uuid4()}/freeze",
+            headers={"X-Service-Key": "wrong"},
+            json={"reason": "x"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_unknown_record_is_404_on_all_three_endpoints(self):
+        import uuid
+
+        unknown = uuid.uuid4()
+        self.assertEqual(
+            self.client.post(
+                f"/records/{unknown}/freeze",
+                headers=SERVICE_HEADERS,
+                json={"reason": "x"},
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.post(f"/records/{unknown}/unfreeze", headers=SERVICE_HEADERS).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(f"/records/{unknown}/freeze", headers=SERVICE_HEADERS).status_code,
+            404,
+        )
+
+    def test_first_freeze_requires_non_blank_reason(self):
+        for body in ({}, {"reason": ""}, {"reason": "   "}):
+            r = self.client.post(
+                f"/records/{self.record_id}/freeze",
+                headers=SERVICE_HEADERS,
+                json=body,
+            )
+            self.assertEqual(r.status_code, 422, (body, r.text))
+        # 仍未冻结
+        self.assertFalse(self._status().json()["frozen"])
+
+    # ---- 冻结/解除/状态基本语义 ----
+
+    def test_freeze_idempotent_keeps_first_period_reason_and_start(self):
+        first = self._freeze(reason="首次原因")
+        self.assertEqual(first.status_code, 200)
+        body = first.json()
+        self.assertEqual(body["status"], "frozen")
+        self.assertFalse(body["already_frozen"])
+        self.assertEqual(body["reason"], "首次原因")
+        freeze_id, frozen_at = body["freeze_id"], body["frozen_at"]
+
+        # 状态查询返回当前冻结期（原因仅维护侧可见）
+        status_body = self._status().json()
+        self.assertTrue(status_body["frozen"])
+        self.assertEqual(status_body["freeze_id"], freeze_id)
+        self.assertEqual(status_body["reason"], "首次原因")
+        self.assertEqual(status_body["frozen_at"], frozen_at)
+
+        # 重复冻结（不同原因 / 空白原因）幂等回放：原因与开始时间不被覆盖
+        for payload in ({"reason": "另一个原因"}, {}, {"reason": "   "}):
+            r = self.client.post(
+                f"/records/{self.record_id}/freeze",
+                headers=SERVICE_HEADERS,
+                json=payload,
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            repeat = r.json()
+            self.assertTrue(repeat["already_frozen"])
+            self.assertEqual(repeat["freeze_id"], freeze_id)
+            self.assertEqual(repeat["frozen_at"], frozen_at)
+            self.assertEqual(repeat["reason"], "首次原因")
+
+    def test_status_false_before_freeze_and_after_unfreeze(self):
+        body = self._status().json()
+        self.assertFalse(body["frozen"])
+        self.assertIsNone(body["freeze_id"])
+
+        first = self._freeze().json()
+        r = self._unfreeze()
+        self.assertTrue(r.json()["unfrozen"])
+        self.assertEqual(r.json()["freeze_id"], first["freeze_id"])
+
+        body = self._status().json()
+        self.assertFalse(body["frozen"])
+        self.assertIsNone(body["freeze_id"])
+
+    def test_unfreeze_is_idempotent_including_never_frozen(self):
+        # 从未冻结：幂等空操作
+        r = self._unfreeze()
+        body = r.json()
+        self.assertFalse(body["unfrozen"])
+        self.assertTrue(body["already_unfrozen"])
+        self.assertIsNone(body["freeze_id"])
+
+        first = self._freeze().json()
+        r = self._unfreeze().json()
+        self.assertTrue(r["unfrozen"])
+        self.assertFalse(r["already_unfrozen"])
+        self.assertEqual(r["freeze_id"], first["freeze_id"])
+        # 再次解除：回放同一冻结期
+        again = self._unfreeze().json()
+        self.assertFalse(again["unfrozen"])
+        self.assertTrue(again["already_unfrozen"])
+        self.assertEqual(again["freeze_id"], first["freeze_id"])
+        self.assertEqual(again["unfrozen_at"], r["unfrozen_at"])
+
+    def test_refreeze_after_unfreeze_starts_new_period(self):
+        first = self._freeze(reason="第一轮")
+        self._unfreeze()
+        second = self._freeze(reason="第二轮")
+        self.assertFalse(second.json()["already_frozen"])
+        self.assertNotEqual(second.json()["freeze_id"], first.json()["freeze_id"])
+        self.assertEqual(second.json()["reason"], "第二轮")
+        status_body = self._status().json()
+        self.assertEqual(status_body["freeze_id"], second.json()["freeze_id"])
+
+    # ---- 公开读取效果 ----
+
+    def test_frozen_record_reads_403_for_all_snapshots_without_quota_or_audit(self):
+        pub1 = self._publish(max_reads=3)
+        sid1, tok1 = pub1["snapshot_id"], pub1["token"]
+        # 冻结前成功读一次
+        self._read(sid1, tok1)
+        audit_before = self._audit_count(sid1)
+
+        # 冻结期间发布新版本快照：同样被覆盖
+        pub2 = self._revise_and_publish(version=2, base_version=1)
+        sid2, tok2 = pub2["snapshot_id"], pub2["token"]
+        self._freeze()
+
+        # 有效单快照令牌、错误令牌一律模糊 403
+        for sid, tok in ((sid1, tok1), (sid2, tok2), (sid1, "not-a-token")):
+            r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+            self.assertEqual(r.status_code, 403, (sid, tok))
+            self.assertEqual(r.json()["detail"], "snapshot unavailable")
+
+        # 不扣次数、不写成功读取审计
+        q = self.client.get(f"/tokens/{tok1}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        self.assertEqual(q["remaining_reads"], 2)
+        self.assertEqual(self._audit_count(sid1), audit_before)
+        self.assertEqual(self._audit_count(sid2), 0)
+
+    def test_unfreeze_restores_only_previously_valid_eligibility(self):
+        pub = self._publish(max_reads=2)
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self._read(sid, tok)  # 已用 1
+        self._freeze()
+        for _ in range(3):
+            self._read(sid, tok, expected=403)
+        self._unfreeze()
+        # 原本仍有效的资格恢复：还能成功 1 次，然后才耗尽
+        self._read(sid, tok)
+        self._read(sid, tok, expected=403)
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 2)
+        self.assertEqual(q["remaining_reads"], 0)
+
+    def test_unfreeze_does_not_revive_withdrawn_snapshot(self):
+        pub = self._publish()
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self._freeze()
+        # 冻结期间撤回该快照
+        r = self.client.post(
+            f"/snapshots/{sid}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "冻结期间撤回"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self._unfreeze()
+        # 已撤回快照不因解除冻结复活
+        self._read(sid, tok, expected=403)
+
+    def test_unfreeze_does_not_revive_revoked_or_exhausted_credential(self):
+        pub = self._publish(max_reads=1)
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self._read(sid, tok)  # 额度耗尽
+        other = self._publish()["token"]
+        self.client.post(f"/tokens/{other}/revoke", headers=SERVICE_HEADERS)
+        self._freeze()
+        self._unfreeze()
+        self._read(sid, tok, expected=403)       # 耗尽不复活
+        self._read(sid, other, expected=403)    # 撤销不复活
+
+    def test_publishing_still_works_while_frozen(self):
+        # 冻结只阻断外部阅览，不阻断发布/修订与受控复核
+        self._freeze()
+        pub = self._publish()
+        self.assertEqual(pub["status"], "published")
+        self._read(pub["snapshot_id"], pub["token"], expected=403)
+
+    def test_other_records_and_bundle_items_remain_readable(self):
+        """共享凭证中其他记录的快照在冻结期间仍可读，冻结项不扣共享额度。"""
+        frozen_pub = self._publish()
+        frozen_sid = frozen_pub["snapshot_id"]
+
+        # 另一条记录
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V2, "intervals": [{"start": 0, "end": 3}]},
+        )
+        other_rid = r.json()["record_id"]
+        r = self.client.post(
+            f"/records/{other_rid}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1, "max_reads": 10},
+        )
+        other_sid = r.json()["snapshot_id"]
+
+        # 共享凭证同时覆盖两条记录的快照
+        submit = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [frozen_sid, other_sid], "max_reads": 5},
+        )
+        self.assertEqual(submit.status_code, 201, submit.text)
+        approve_body = self.client.post(
+            f"/bundle-requests/{submit.json()['request_id']}/approve", auth=BASIC_BOB
+        ).json()
+        cred = approve_body["credential"]
+        bundle_id = approve_body["bundle_id"]
+
+        # 冻结第一条记录前，两处都可读
+        self._read(frozen_sid, cred)
+        self._read(other_sid, cred)
+        self._freeze()
+        # 冻结项：403 且不扣共享额度
+        self._read(frozen_sid, cred, expected=403)
+        self._read(frozen_sid, cred, expected=403)
+        # 其他记录项继续可读
+        self._read(other_sid, cred)
+        status_body = self.client.get(
+            f"/read-bundles/{bundle_id}", headers=SERVICE_HEADERS
+        ).json()
+        # 成功 3 次（冻结项两次 403 未扣）
+        self.assertEqual(status_body["reads_used"], 3)
+        # 解除后冻结项恢复可读，继续共用同一额度
+        self._unfreeze()
+        self._read(frozen_sid, cred)
+        status_body = self.client.get(
+            f"/read-bundles/{bundle_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 4)
+
+    def test_concurrent_freeze_and_reads_respect_commit_boundary(self):
+        pub = self._publish(max_reads=50)
+        sid, tok = pub["snapshot_id"], pub["token"]
+        results: list[int] = []
+        barrier = threading.Barrier(9)
+
+        def freeze():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/freeze",
+                headers=SERVICE_HEADERS,
+                json={"reason": "并发冻结"},
+            )
+            results.append(0 if r.status_code == 200 else r.status_code)
+
+        def read_once():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            results.append(
+                client.get(f"/public/snapshots/{sid}?token={tok}").status_code
+            )
+
+        threads = [threading.Thread(target=freeze)]
+        threads += [threading.Thread(target=read_once) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertIn(0, results)  # 冻结成功
+        concurrent_reads = [c for c in results if c != 0]
+        self.assertTrue(all(c in (200, 403) for c in concurrent_reads), results)
+        # 冻结提交后的新读取稳定 403
+        for _ in range(5):
+            self.assertEqual(
+                self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 403
+            )
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        # 消耗次数恰为并发阶段的 200 数，冻结后的 403 未消耗
+        self.assertEqual(q["reads_used"], concurrent_reads.count(200))
+        # 审计事件数同样恰为 200 数
+        self.assertEqual(self._audit_count(sid), concurrent_reads.count(200))
+
+    def test_blank_reason_freeze_after_concurrent_unfreeze_is_422(self):
+        """锁等待期间冻结期被并发解除：空白原因的重复冻结不得开启新冻结期（422）。
+
+        协调线程先持有记录行锁并解除已有冻结期；空白原因的冻结请求此时阻塞在
+        记录行锁队列中。放行后该请求看到“无进行中冻结期”，必须按首次冻结处理
+        并以 422 拒绝，而不是用空白原因插入新冻结期。
+        """
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+        from app.models import RecordFreeze
+
+        # 先建立一个进行中的冻结期
+        self._freeze(reason="已在冻结期")
+
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_record_lock_and_unfreeze():
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text("SELECT id FROM records WHERE id = :rid FOR UPDATE"),
+                    {"rid": self.record_id},
+                )
+                holder_ready.set()
+                release_holder.wait(timeout=10)
+                # 持锁期间解除：冻结请求仍在队列中，尚未看到解除
+                session.execute(
+                    sql_text(
+                        "UPDATE record_freezes SET unfrozen_at = now() "
+                        "WHERE record_id = :rid AND unfrozen_at IS NULL"
+                    ),
+                    {"rid": self.record_id},
+                )
+                session.commit()
+            finally:
+                session.close()
+
+        holder = threading.Thread(target=hold_record_lock_and_unfreeze)
+        holder.start()
+        self.assertTrue(holder_ready.wait(timeout=10))
+
+        codes: list[int] = []
+
+        def freeze_blank():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/freeze",
+                headers=SERVICE_HEADERS,
+                json={"reason": "   "},
+            )
+            codes.append(r.status_code)
+
+        waiter = threading.Thread(target=freeze_blank)
+        waiter.start()
+        time.sleep(0.5)  # 确保冻结请求已排队在记录行锁上
+        release_holder.set()
+        waiter.join(timeout=10)
+        holder.join(timeout=10)
+
+        self.assertEqual(codes, [422])
+        # 没有产生新的冻结期，记录保持解除状态
+        self.assertFalse(self._status().json()["frozen"])
+        with SessionLocal() as session:
+            total = (
+                session.query(RecordFreeze)
+                .filter(RecordFreeze.record_id == self.record_id)
+                .count()
+            )
+        self.assertEqual(total, 1)
+
+    def test_concurrent_freezes_and_unfreezes_are_idempotent(self):
+        """并发冻结只产生一个当前冻结期；并发解除恰好一个成功。"""
+        barrier = threading.Barrier(3)
+
+        def freeze():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            client.post(
+                f"/records/{self.record_id}/freeze",
+                headers=SERVICE_HEADERS,
+                json={"reason": "并发"},
+            )
+
+        # 3 个并发冻结：只有一个首次结果
+        threads = [threading.Thread(target=freeze) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        from app.db import SessionLocal
+        from app.models import RecordFreeze
+
+        with SessionLocal() as session:
+            active = (
+                session.query(RecordFreeze)
+                .filter(RecordFreeze.record_id == self.record_id)
+                .count()
+            )
+        self.assertEqual(active, 1)
+        body = self._status().json()
+        self.assertTrue(body["frozen"])
+        self.assertEqual(body["reason"], "并发")
+
+        # 3 个并发解除：最终恰好解除一次
+        barrier2 = threading.Barrier(3)
+
+        def unfreeze2():
+            barrier2.wait()
+            client = TestClient(app_main.app)
+            client.post(f"/records/{self.record_id}/unfreeze", headers=SERVICE_HEADERS)
+
+        threads = [threading.Thread(target=unfreeze2) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertFalse(self._status().json()["frozen"])
+        with SessionLocal() as session:
+            active = (
+                session.query(RecordFreeze)
+                .filter(
+                    RecordFreeze.record_id == self.record_id,
+                    RecordFreeze.unfrozen_at.is_(None),
+                )
+                .count()
+            )
+            total = (
+                session.query(RecordFreeze)
+                .filter(RecordFreeze.record_id == self.record_id)
+                .count()
+            )
+        self.assertEqual(active, 0)
+        self.assertEqual(total, 1)  # 并发冻结没有产生多余冻结期
+
+
 if __name__ == "__main__":
     unittest.main()

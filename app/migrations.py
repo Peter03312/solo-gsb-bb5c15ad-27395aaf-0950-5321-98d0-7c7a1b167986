@@ -3,7 +3,8 @@
 服务启动时在 PostgreSQL 会话级咨询锁（advisory lock）保护下，把数据库结构
 单向、可重入地升级到当前代码支持的版本：
 
-- 空库：从 v1 开始依次执行“初始建表 -> 历史缺列补齐 -> 审计防改写约束”。
+- 空库：从 v1 开始依次执行“初始建表 -> 历史缺列补齐 -> 审计防改写约束 ->
+  记录冻结期表”。
 - 升级框架出现之前的旧库（无 ``schema_migrations`` 但已有业务表）：
   把既有结构补登为 v1 基线，再依次执行 v2/v3；所有语句均为幂等的
   ``IF NOT EXISTS``，且数据补齐只作用于仍为 NULL 的行，绝不重写已有数据。
@@ -49,6 +50,7 @@ LEGACY_MARKER_TABLES = (
     "read_bundle_items",
     "credential_rotations",
     "read_audit_events",
+    "record_freezes",
 )
 
 _BASELINE_NOTE = "初始建表（升级框架出现前旧库的基线补登，未重放任何变更）"
@@ -177,11 +179,21 @@ def _migrate_3_audit_append_only(conn) -> None:
     )
 
 
+def _migrate_4_record_freezes(conn) -> None:
+    """v4：记录临时冻结期表（幂等建表，不改动任何既有表与数据）。
+
+    空库路径下 v1 的 create_all 已按当前模型建出该表，此处 checkfirst 跳过；
+    旧库增量升级时补齐该表。既有记录默认无冻结行，公开读取行为不变。
+    """
+    Base.metadata.create_all(bind=conn, tables=[models.RecordFreeze.__table__], checkfirst=True)
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
     (2, "historical_columns_and_rotation_chain", _migrate_2_historical_columns),
     (3, "audit_events_append_only", _migrate_3_audit_append_only),
+    (4, "record_freezes", _migrate_4_record_freezes),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

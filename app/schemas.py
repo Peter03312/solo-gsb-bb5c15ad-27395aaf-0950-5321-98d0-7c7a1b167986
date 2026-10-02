@@ -57,6 +57,48 @@ class SnapshotWithdrawResponse(BaseModel):
     status: str
 
 
+# ---- 记录临时冻结（覆盖该记录全部快照的外部阅览） ----
+
+
+class RecordFreezeRequest(BaseModel):
+    # 冻结原因：首次冻结必填（非空白），重复冻结时沿用当前冻结期的值、忽略本次内容
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class RecordFreezeResponse(BaseModel):
+    """冻结结果：重复冻结也返回当前冻结期的标识、首次冻结时间与原因。"""
+
+    record_id: UUID
+    freeze_id: UUID
+    status: str
+    reason: str
+    frozen_at: datetime
+    # true 表示本次为首次冻结；false 表示重复冻结回放当前冻结期（原因/时间不被覆盖）
+    already_frozen: bool = False
+
+
+class RecordUnfreezeResponse(BaseModel):
+    """解除结果：重复解除或从未冻结时 unfrozen 为 false、各时间字段可能为空。"""
+
+    record_id: UUID
+    freeze_id: UUID | None = None
+    frozen_at: datetime | None = None
+    unfrozen_at: datetime | None = None
+    unfrozen: bool
+    already_unfrozen: bool
+
+
+class RecordFreezeStatusResponse(BaseModel):
+    """维护侧冻结状态：进行中时返回当前冻结期标识、原因与开始时间。"""
+
+    record_id: UUID
+    frozen: bool
+    freeze_id: UUID | None = None
+    reason: str | None = None
+    frozen_at: datetime | None = None
+    unfrozen_at: datetime | None = None
+
+
 class RecordResponse(BaseModel):
     record_id: UUID
     version: int

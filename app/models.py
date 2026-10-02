@@ -15,6 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     false,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -80,6 +81,48 @@ class Snapshot(Base):
     )
     # 撤回原因仅维护侧可见，公开侧的模糊 403 绝不透露它
     withdraw_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class RecordFreeze(Base):
+    """记录的临时冻结期：冻结覆盖该记录现有及冻结期间新发布的全部快照。
+
+    每行代表一次冻结期：frozen_at 为冻结提交时刻（非空即当前/历史冻结期），
+    unfrozen_at 为空表示当前正在冻结；解除冻结时只写解除时刻，行永久留存。
+    部分唯一索引 uq_record_freezes_active 保证每条记录至多一个进行中的冻结期，
+    重复冻结因此幂等：当前冻结期的原因与开始时间永不被覆盖。
+    """
+
+    __tablename__ = "record_freezes"
+    __table_args__ = (
+        Index(
+            "uq_record_freezes_active",
+            "record_id",
+            unique=True,
+            postgresql_where=text("unfrozen_at IS NULL"),
+        ),
+        Index("ix_record_freezes_record", "record_id", "frozen_at"),
+        CheckConstraint(
+            "unfrozen_at IS NULL OR unfrozen_at >= frozen_at",
+            name="ck_record_freezes_unfrozen_after_frozen",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    record_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("records.id", ondelete="CASCADE"), nullable=False
+    )
+    # 冻结原因：首次冻结时写入，重复冻结不覆盖；仅维护侧接口返回，公开侧绝不透露
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    frozen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 解除时刻：为空表示当前冻结期仍在进行；解除后只恢复原本仍有效的读取资格
+    unfrozen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class ReadToken(Base):

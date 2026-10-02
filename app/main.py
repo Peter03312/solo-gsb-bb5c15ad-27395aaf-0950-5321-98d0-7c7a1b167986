@@ -38,6 +38,7 @@ from .models import (
     ReadBundleRequest,
     ReadToken,
     Record,
+    RecordFreeze,
     RecordVersion,
     ROTATION_KIND_BUNDLE,
     ROTATION_KIND_TOKEN,
@@ -69,9 +70,13 @@ from .schemas import (
     ReadBundleListResponse,
     ReadBundleStatusResponse,
     RecordCreateRequest,
+    RecordFreezeRequest,
+    RecordFreezeResponse,
+    RecordFreezeStatusResponse,
     RecordResponse,
     RecordReviseRequest,
     RecordStatusResponse,
+    RecordUnfreezeResponse,
     ReviewRejectRequest,
     RevokeResponse,
     RotationBundleItem,
@@ -160,8 +165,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.6.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 版本化数据库升级）",
+    version="1.7.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -1454,6 +1459,186 @@ def withdraw_snapshot(
     )
 
 
+# ---- 记录临时冻结：覆盖该记录现有及期间新发布全部快照的外部阅览 ----
+
+
+def _record_freeze_status(
+    db: Session, record_id: UUID
+) -> RecordFreezeStatusResponse:
+    """组装维护侧冻结状态：进行中返回当前冻结期，否则只回 frozen=false。"""
+    current = db.execute(
+        select(RecordFreeze)
+        .where(
+            RecordFreeze.record_id == record_id,
+            RecordFreeze.unfrozen_at.is_(None),
+        )
+    ).scalar_one_or_none()
+    if current is None:
+        return RecordFreezeStatusResponse(record_id=record_id, frozen=False)
+    return RecordFreezeStatusResponse(
+        record_id=record_id,
+        frozen=True,
+        freeze_id=current.id,
+        reason=current.reason,
+        frozen_at=current.frozen_at,
+        unfrozen_at=None,
+    )
+
+
+@app.post(
+    "/records/{record_id}/freeze",
+    response_model=RecordFreezeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def freeze_record(
+    record_id: UUID,
+    payload: RecordFreezeRequest = Body(default_factory=RecordFreezeRequest),
+    db: Session = Depends(get_db),
+):
+    """临时冻结记录的外部阅览：覆盖现有及冻结期间新发布的全部快照。
+
+    - 未知记录 -> 404；缺失/错误服务密钥 -> 401；
+    - 首次冻结必须提供非空白原因 -> 422；
+    - 重复冻结幂等：返回当前冻结期首次冻结时间与原因，当前冻结期的
+      原因与开始时间不得被覆盖（即使本次携带不同或空白原因）；
+    - 加锁顺序与公开读取一致（先记录行、再该记录全部快照行，最后写冻结期行），
+      与公开读取经快照行锁串行化：冻结提交后开始的读取必定在计数前被拒绝。
+    """
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    # 记录行行锁串行化并发冻结/解除；随后锁定该记录全部快照行，
+    # 与公开读取的快照行锁同序，保证冻结与读取的提交边界一致。
+    db.execute(select(Record.id).where(Record.id == record_id).with_for_update())
+    db.execute(
+        select(Snapshot.id)
+        .where(Snapshot.record_id == record_id)
+        .order_by(Snapshot.id)  # 多行按主键序获锁，与跨记录快照锁（批准/换发）同序，杜绝死锁
+        .with_for_update()
+    ).all()
+    # 锁后判定：等待锁期间可能已有并发冻结（回放）或解除（按首次冻结处理），
+    # 因此“非空白原因”的校验必须以锁后状态为准，避免用空白原因开启新冻结期。
+    current = db.execute(
+        select(RecordFreeze)
+        .where(
+            RecordFreeze.record_id == record_id,
+            RecordFreeze.unfrozen_at.is_(None),
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if current is not None:
+        # 已在冻结期（含被并发的首次冻结终结）：回放当前冻结期，忽略本次原因
+        db.rollback()
+        return RecordFreezeResponse(
+            record_id=record_id,
+            freeze_id=current.id,
+            status="frozen",
+            reason=current.reason,
+            frozen_at=current.frozen_at,
+            already_frozen=True,
+        )
+    if not (payload.reason and payload.reason.strip()):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reason is required when freezing a record",
+        )
+    freeze = RecordFreeze(record_id=record_id, reason=payload.reason)
+    db.add(freeze)
+    db.commit()
+    db.refresh(freeze)
+    return RecordFreezeResponse(
+        record_id=record_id,
+        freeze_id=freeze.id,
+        status="frozen",
+        reason=freeze.reason,
+        frozen_at=freeze.frozen_at,
+        already_frozen=False,
+    )
+
+
+@app.post(
+    "/records/{record_id}/unfreeze",
+    response_model=RecordUnfreezeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def unfreeze_record(record_id: UUID, db: Session = Depends(get_db)):
+    """解除记录冻结：只恢复原本仍有效的读取资格，幂等可重复调用。
+
+    解除不复活任何已撤回快照、已过期/撤销/换发凭证或已耗尽额度；
+    从未冻结或已解除时返回 unfrozen=false（幂等空操作）。
+    与冻结、公开读取按相同锁序（记录行 -> 快照行 -> 冻结期行）串行化，
+    解除提交后开始的读取恢复按既有资格判定。
+    """
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    db.execute(select(Record.id).where(Record.id == record_id).with_for_update())
+    db.execute(
+        select(Snapshot.id)
+        .where(Snapshot.record_id == record_id)
+        .order_by(Snapshot.id)  # 多行按主键序获锁，与跨记录快照锁（批准/换发）同序，杜绝死锁
+        .with_for_update()
+    ).all()
+    # 原子条件 UPDATE：只命中进行中的冻结期；并发解除恰好一个成功
+    freeze_id, frozen_at, unfrozen_at = db.execute(
+        update(RecordFreeze)
+        .where(
+            RecordFreeze.record_id == record_id,
+            RecordFreeze.unfrozen_at.is_(None),
+        )
+        .values(unfrozen_at=func.now())
+        .returning(RecordFreeze.id, RecordFreeze.frozen_at, RecordFreeze.unfrozen_at)
+    ).one_or_none() or (None, None, None)
+    if freeze_id is None:
+        # 从未冻结，或已被（并发的）解除终结：读回最近一次冻结期以幂等回放
+        db.rollback()
+        latest = db.execute(
+            select(RecordFreeze)
+            .where(RecordFreeze.record_id == record_id)
+            .order_by(RecordFreeze.frozen_at.desc())
+        ).scalar_one_or_none()
+        if latest is None:
+            return RecordUnfreezeResponse(
+                record_id=record_id,
+                unfrozen=False,
+                already_unfrozen=True,
+            )
+        return RecordUnfreezeResponse(
+            record_id=record_id,
+            freeze_id=latest.id,
+            frozen_at=latest.frozen_at,
+            unfrozen_at=latest.unfrozen_at,
+            unfrozen=False,
+            already_unfrozen=True,
+        )
+    db.commit()
+    return RecordUnfreezeResponse(
+        record_id=record_id,
+        freeze_id=freeze_id,
+        frozen_at=frozen_at,
+        unfrozen_at=unfrozen_at,
+        unfrozen=True,
+        already_unfrozen=False,
+    )
+
+
+@app.get(
+    "/records/{record_id}/freeze",
+    response_model=RecordFreezeStatusResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_record_freeze_status(record_id: UUID, db: Session = Depends(get_db)):
+    """维护侧查询记录冻结状态：进行中时返回当前冻结期标识、原因与开始时间。
+
+    原因仅维护侧可见；未知记录 404；从未冻结返回 frozen=false。
+    """
+    record = db.get(Record, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
+    return _record_freeze_status(db, record_id)
+
+
 @app.get(
     "/records/{record_id}",
     response_model=RecordStatusResponse,
@@ -1497,9 +1682,12 @@ def read_snapshot(
 ):
     """公开读取：凭有效令牌或多快照共享凭证返回脱敏正文。
 
-    先对快照行加锁再判定有效性，使读取与永久撤回由数据库行锁串行化：
-    撤回提交后才开始的读取在此看到 withdrawn_at 非空，直接返回模糊 403，
-    既不返回正文也不执行计数 UPDATE（不消耗任何额度）。
+    先对快照行加锁再判定有效性，使读取与永久撤回、记录冻结/解除由数据库
+    行锁串行化：撤回或冻结提交后才开始的读取在此看到 withdrawn_at 非空或
+    记录存在进行中的冻结期，直接返回模糊 403，既不返回正文也不执行计数
+    UPDATE（不消耗任何额度）、不写成功读取审计。冻结覆盖该记录现有及期间
+    新发布的全部快照，但共享凭证中其他记录的快照仍可读；解除冻结后只恢复
+    原本仍有效的读取资格（已撤回快照、过期/撤销/换发凭证、耗尽额度不复活）。
 
     单快照令牌：有效性判定与次数消耗由同一条条件 UPDATE 原子完成
     （未撤销、未到期、(不限次或 reads_used < max_reads)）。
@@ -1521,8 +1709,23 @@ def read_snapshot(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
     ).scalar_one_or_none()
     if snapshot is None or snapshot.withdrawn_at is not None:
-        # 不区分“快照不存在 / 已撤回 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
+        # 不区分“快照不存在 / 已撤回 / 已冻结 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
         # 快照不存在或已撤回时直接拒绝，不触碰任何读取计数，也不写审计事件。
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    # 记录级临时冻结：冻结覆盖该记录现有及期间新发布的全部快照。
+    # 此刻已持有该快照行锁——冻结/解除事务提交前必须锁过同一快照行，
+    # 故这里看到进行中的冻结期即说明冻结已先于本次读取提交：拒绝且不计数、
+    # 不写成功读取审计；冻结期内新发布的快照同理由记录级查询命中。
+    record_frozen = db.execute(
+        select(RecordFreeze.id).where(
+            RecordFreeze.record_id == snapshot.record_id,
+            RecordFreeze.unfrozen_at.is_(None),
+        )
+    ).first()
+    if record_frozen is not None:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
