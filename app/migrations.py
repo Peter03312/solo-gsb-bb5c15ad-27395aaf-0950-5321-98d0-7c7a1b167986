@@ -177,11 +177,39 @@ def _migrate_3_audit_append_only(conn) -> None:
     )
 
 
+def _migrate_4_record_freezes(conn) -> None:
+    """v4：记录临时冻结表与“每条记录至多一个当前冻结期”的部分唯一索引。
+
+    空库路径下 v1 的 create_all 已按当前模型建出完整表与索引，此处幂等；
+    旧库路径先按当前模型补齐可能缺失的整张表，再以 CREATE INDEX IF NOT
+    EXISTS 收敛索引定义。只新增结构，不改动任何既有数据：既有记录默认未冻结，
+    全部快照继续按既有资格公开可读。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_record_freezes_active
+            ON record_freezes (record_id) WHERE unfrozen_at IS NULL
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_record_freezes_record
+            ON record_freezes (record_id, frozen_at)
+            """
+        )
+    )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
     (2, "historical_columns_and_rotation_chain", _migrate_2_historical_columns),
     (3, "audit_events_append_only", _migrate_3_audit_append_only),
+    (4, "record_freezes", _migrate_4_record_freezes),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]
